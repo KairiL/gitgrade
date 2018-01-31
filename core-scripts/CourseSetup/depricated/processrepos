@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+
+documentation = ''' Process repositories according to a function named 
+processrepo provide through a file using the --processrepofile option.  
+The processrepo function has three required arguments: the first is
+the university of ID of a student, the second is the path to their
+repository, and the third is a logging object. The function may return
+a list of scores if grade collection is being done, otherwise it may
+return and empty list. Note well that the execution of this function
+is not sandboxed in anyway; a malicious student could engineer a
+homework to delete your home director.'''
+
+# This script allows repos owned by teams and matching certain filters to be 
+# cloned and modified.
+
+# System level imports.
+from defaultoptions import getDefaultOptions
+import os
+import sys
+import inspect
+import argparse
+import traceback
+import re
+import csv
+import datetime, dateutil.parser
+from dateutil import tz
+from getpass import getuser, getpass
+
+sys.path.append ('/export/scratch/mein/evw/dependencies/sh')
+sys.path.append ('/export/scratch/mein/evw/dependencies/uritemplate')
+sys.path.append ('/export/scratch/mein/evw/dependencies/requests')
+sys.path.append ('/export/scratch/mein/evw/dependencies/github3.py')
+
+# Path relative imports.
+import github3
+import logger
+from sh import git,rm,cd
+def __checkRegExp(regexp):
+    try:
+        return re.compile(regexp)
+    except re.error:
+        msg = "Invalid regular expression"
+        raise argparse.ArgumentTypeError(msg)
+
+# Setup command line argument parser.
+argparser = getDefaultOptions(documentation,user=True)
+argparser.add_argument("--processrepofile"
+                       , help="A python file containing a processrepo function."
+                       , required=True)
+argparser.add_argument("--outputcsv"
+                       , help="The file that will store the grading results."
+                       , type=argparse.FileType('w')
+                       , default=sys.stdout)
+teamformathelpstr = ("A format string indicating how the team name relates"
+
+                     + "to the uid. An example string would be 'team-{uid}.")
+argparser.add_argument("--teamformat"
+                       , help=teamformathelpstr
+                       , default="team-{uid}"
+                       , dest='teamformat'
+                       , type=str)
+argparser.add_argument("--repofilter"
+                       , help=('A regular expression to filter repositories'
+                               +' names by.')
+                       , default=".*"
+                       , type=__checkRegExp)
+argparser.add_argument("--noremove"
+                       , help=('Do not remove the repositories after they have'
+                               +' been processed.')
+                       ,action='store_true'
+                       ,default=False)
+argparser.add_argument("uid"
+                       , metavar="uid"
+                       , help="Student id."
+                       , nargs="+"
+                       , type=str)
+# Parse command line arguments.
+args = argparser.parse_args()
+
+# Setup logger.
+if args.logfile == None:
+    logfile = None
+else:
+    logfile = args.logfile.name
+
+logger = logger.getLogger(args.loglevel,logfile=logfile)
+
+# Load ProcessRepo class.
+try:
+    processrepomodule = __import__(args.processrepofile)
+except:
+    logger.critical("Failed to import %s:\n%s" 
+                    %(args.processrepofile,traceback.format_exc()))
+    print("Could not load %s." % args.processrepofile)
+    sys.exit(1)
+
+# Get credentials
+password = None
+while not password:
+    password = getpass('Password for {0}: '.format(args.user))
+
+# Login to github enterprise.
+gh = None
+try:
+    enterprise = github3.GitHubEnterprise(args.github
+                                          , username=args.user
+                                          , password=password)
+    gh = enterprise
+    gh.zen()
+except:
+    gh = None
+    logger.critical("Failed to login as user %s:\n%s" 
+                    % (args.user,traceback.format_exc()))
+    print("Could not connect or login to server.");
+    sys.exit(1)
+
+# Enter organization.
+try:
+    org = gh.organization(args.org)
+except:
+    logger.critical("Problem accessing organization %s:\n%s" 
+                    % (args.org,traceback.format_exc()))
+    print("Could not access organization %s." % args.org)
+    sys.exit(1)
+
+scriptdir = os.getcwd()
+
+writer = csv.writer(args.outputcsv)
+
+# Process uids.
+for uid in args.uid:
+
+    logger.info("Processing %s." % uid)
+
+    # Build team names from format string and uid.
+    interpolationvalues = { 'uid' : uid }
+    teamname = args.teamformat.format(**interpolationvalues)
+
+    # Find the team associated with this uid.
+    team = None
+    success = False
+    for t in org.teams():
+        if t.name == teamname and team == None:
+            team = t
+            logger.info("Found team %s for uid %s." % (teamname,uid))
+            success = True
+
+    if not success:
+        msg = "Could not find team, ignoring uid %s." % uid
+        logger.error(msg)
+        print(msg)
+        continue
+
+
+    # Loop through the team repos.
+    
+    success = False
+    for repo in team.repositories():
+
+        logger.info("Testing if %s for team %s matches filter." 
+                    % (repo.name,teamname))
+        # Skip this repo if it does not match the filter.
+        if not args.repofilter.match(repo.name):
+            continue
+
+        validcommit = None
+        foundcommit = False
+        if args.duedate != None:
+            duedate = dateutil.parser.parse(args.duedate)
+            duedate = duedate.replace(tzinfo=tz.tzlocal())
+            bestdate = None
+            for commit in repo.commits():
+                logger.info("Commit date %s" % commit.commit.get("commit").get("committer").get("date"))
+                commitdate = dateutil.parser.parse(
+                    commit.commit.get("commit").get("committer").get("date"))
+                commitdate = commitdate.replace(tzinfo=tz.tzutc())
+                if((foundcommit == False and duedate>=commitdate)
+                   or (duedate>=commitdate and commitdate>bestdate)):
+                    bestdate =  dateutil.parser.parse(commit.commit.get("commit").get("committer").get("date"))
+                    validcommit = commit 
+                    foundcommit = True
+        
+                    logger.info("New valid commit date %s:" % validcommit.commit.get("commit").get("committer").get("date"))
+
+            if(not foundcommit):
+                logger.error("No commit found be %s for %s" 
+                             % (args.duedate,repo.name))
+                continue
+
+        logger.info("Cloning repo %s for team %s." % (repo.name,teamname))
+        # FIXME: I would like to enter the password through the git prompt but I could not get that to work.
+        # This is a working solution but is unacceptable; the sh module will store the password in clear text and possibly output it on error.
+        cloneurl = re.sub(r':\/\/','://%s:%s@'%(args.user,password),repo.clone_url)
+        
+        try:
+            p = git.clone(cloneurl)
+        except:
+            logger.warning("Cannot clone repository %s." % repo.name)
+            continue
+
+        if foundcommit:
+            logger.info("Hard reset to %s for repo %s." % (validcommit.sha,repo.name))
+            try:
+                cd(repo.name)
+                p = git.reset('--hard',validcommit.sha)
+                cd('../')
+            except:
+                logger.warning("Hard reset to %s for repo %s failed." % (validcommit.sha,repo.name))
+                continue
+
+        grade = processrepomodule.processrepo(uid,os.path.abspath("./%s/")%(repo.name),logger)
+        grade.insert(0,repo.name)
+        grade.insert(0,uid)
+        writer.writerow(grade)
+        cd(scriptdir)
+        if not args.noremove:
+            rm("-r",repo.name)

@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+# System level imports.
+from defaultoptions import getDefaultOptions
+import os
+import sys
+import inspect
+import argparse
+import traceback
+from getpass import getuser, getpass
+
+sys.path.append ('/export/scratch/mein/evw/dependencies/uritemplate')
+sys.path.append ('/export/scratch/mein/evw/dependencies/github3.py')
+sys.path.append ('/export/scratch/mein/evw/dependencies/requests')
+
+# Path relative imports.
+import github3
+import logger
+
+
+# Setup command line argument parser.
+argparser = getDefaultOptions("Create a new team containing a student id and add a newly created repo to that team.",user=True)
+teamformathelpstr = """A format string indicating how the team name should be created based on the uid. An example string would be 'team-{uid}."""
+argparser.add_argument("--teamformat", help=teamformathelpstr,default="team-{uid}", dest='teamformat', type=str)
+repoformathelpstr = """A format string indicating how the repo name should be created based on the uid. An example string would be 'repo-{uid}."""
+argparser.add_argument("-repoformat", help=repoformathelpstr, default="repo-{uid}", dest='repoformat', type=str)
+argparser.add_argument("uid",metavar="uid", help="Student id.",nargs="+",type=str)
+
+# Parse command line arguments.
+args = argparser.parse_args()
+
+# Setup logger.
+logger = logger.getLogger(args.loglevel,args.logfile)
+
+# Get credentials
+password = ''
+while not password:
+    password = getpass('Password for {0}: '.format(args.user))
+
+# Login to github enterprise.
+gh = None
+try:
+    enterprise = github3.GitHubEnterprise(args.github,args.user,password=password)
+    gh = enterprise
+    gh.zen()
+except:
+    gh = None
+    logger.critical("Failed to login as user %s:\n%s" % (args.user,traceback.format_exc()))
+    print("Could not connect or login to server.");
+    sys.exit(1)
+
+# Enter organization.
+try:
+    org = gh.organization(args.org)
+except:
+    logger.critical("Problem accessing organization %s:\n%s" % (args.org,traceback.format_exc()))
+    print("Could not access organization %s." % args.org)
+    sys.exit(1)
+
+# Process uids.
+for uid in args.uid:
+
+    logger.info("Starting setup for %s." % uid)
+    
+    # Build team and repo names from format string and uid.
+    interpolationvalues = { 'uid' : uid }
+    teamname = args.teamformat.format(**interpolationvalues)
+    reponame = args.repoformat.format(**interpolationvalues)
+
+    # Create team.
+    team = None
+    teamadded = False
+    success = False
+    try:
+        logger.info("No %s team found, creating one." % teamname)
+        team = org.create_team(teamname,[],"push")
+        teamadded = True
+        success = True
+    except:
+        team = None
+        logger.error("Failed during team creation process for team %s:\n%s" % (teamname,traceback.format_exc()))
+
+    if not success:
+        print("Failed to create team %s, ignore setup for %s"%(teamname,uid))
+        continue
+     
+    # Add uid to team. If this fails remove the team and continue.
+    success = False    
+    try:
+        logger.info("Attempting to add %s to team %s." % (uid,teamname))
+        
+
+        if team.is_member(uid):
+            logger.warning("Uid %s is already a part of team %s." % (uid,teamname))
+            success=True
+        else:
+            logger.info("Adding %s."%uid)
+            team.invite(uid)
+            success = True
+    except:
+        logger.error("Failed to add %s to team %s:\n%s" % (uid,teamname,traceback.format_exc()))
+        success = False
+
+    if not success:
+        print("Failed to find %s, deleting team %s and ignoring setup for this user."%(uid,teamname))
+        if teamadded:
+            logger.debug("Removing team %s." % teamname)
+            team.delete()
+        continue
+
+    # Create repository.
+    repo = None
+    repoadded = False
+    success = False
+    try:
+        logger.info("Creating repo %s" % reponame)
+        repo = org.create_repository(reponame,
+                               description='',
+                               homepage='',
+                               private=True,
+                               has_issues=True,
+                               has_wiki=True,
+                               auto_init=True,
+        )
+        repoadded = True
+        success=True
+    except:
+        logger.error("Failed to create repo %s:\n%s" % (reponame,traceback.format_exc()))
+        repo = None
+
+    if not success:
+        print("Failed to create repo %s, deleting team and ignoring setup for %s"%(uid ,reponame))
+        if teamadded:
+            logger.debug("Removing team %s." % teamname)
+            team.delete()
+        continue
+
+    # Add the team to the repo.
+    success = False
+    try:
+        logger.info("Attempting to add team %s to repo %s." % (teamname,reponame))
+        if team.has_repository(repo):
+            logger.warning("Team %s already has access to repo %s." % (teamname,reponame))
+        else:
+            logger.info("Adding repo %s to team %s." % (reponame,teamname))
+            success = team.add_repository(str(repo))
+    
+    except:
+        success = False
+        logger.error("Failed to add repo %s to team %s:\n%s" % (reponame,teamname,traceback.format_exc()))
+
+    if not success:
+        print("Failed to add team %s to repo %s, deleting team, deleting repo, and ignoring setup for %s"%(teamname,reponame,uid))
+        if teamadded:
+            logger.debug("Removing team %s." % teamname)
+            team.delete()
+        if repoadded:
+            logger.debug("Removing repo %s." % reponame)
+            team.delete()
+        continue
